@@ -1,4 +1,4 @@
-﻿# ASCII Art OFX Plugin
+# ASCII Art OFX Plugin
 
 High-performance OpenFX (OFX) image effect plugin for DaVinci Resolve and other OFX-compliant hosts. Converts video tracks and clips into customizable ASCII art in real time on Windows and Linux.
 
@@ -26,6 +26,16 @@ High-performance OpenFX (OFX) image effect plugin for DaVinci Resolve and other 
 - Frame Hold / Performance Multiplier:
   - Update every N frames (1 to 12): Renders at 1/2, 1/3, or lower frame rates for classic retro/terminal cadence while reducing GPU/CPU render time by 50-70%.
 - Edge-to-Edge Sampling: 100% border coverage without edge cropping or grid misalignments.
+
+---
+
+## Downloads
+
+Download the latest pre-compiled binaries:
+- [AsciiArt_OFX_Windows.zip](https://github.com/SKBwastaken/ASCIICreatorOFX/releases/download/v1.2.0/AsciiArt_OFX_Windows.zip) (Windows x64 - Includes 1-Click `Install.bat`)
+- [AsciiArt_OFX_Linux.zip](https://github.com/SKBwastaken/ASCIICreatorOFX/releases/download/v1.2.0/AsciiArt_OFX_Linux.zip) (Linux x86_64 - Includes `install.sh`)
+
+View all releases: [Releases Page](https://github.com/SKBwastaken/ASCIICreatorOFX/releases)
 
 ---
 
