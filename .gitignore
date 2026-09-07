@@ -1,0 +1,16 @@
+# Compiler and build artifacts
+*.obj
+*.exp
+*.lib
+*.pdb
+*.ilk
+*.tmp
+*.bak
+build/
+.vs/
+.vscode/
+
+# OS and temporary files
+Thumbs.db
+.DS_Store
+*.swp
