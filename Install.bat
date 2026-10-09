@@ -20,7 +20,7 @@ echo ========================================================
 echo.
 echo   What's New in v1.3 (Build 11):
 echo   * Curated Style Presets (Goliath Cyber Lime, Classic Matrix, Cyberpunk, etc.)
-echo   * Real-Time CRT Phosphor Glow / Bloom (Screen & Additive modes)
+echo   * Bundled Consolas Monospace font with automatic cross-platform fallback
 echo   * Expanded Color Modes (CGA, ZX Spectrum, Matrix Green, Cyberpunk Neon, etc.)
 echo   * Renamed effect to clean "ASCII" inside DaVinci Resolve
 echo   * Inspector GitHub Link button: https://github.com/SKBwastaken/ASCIICreatorOFX

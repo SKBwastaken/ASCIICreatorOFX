@@ -8,7 +8,6 @@ High-performance OpenFX (OFX) image effect plugin for DaVinci Resolve and other 
 
 - Real-Time Multi-Core Rendering: CPU-accelerated rendering utilizing OpenMP across all available cores.
 - Curated Style Presets: One-click presets to instantly dial in signature aesthetics (Goliath Cyber Lime, Classic Matrix CRT, Full Color Hi-Fi, Pure 1-Bit Terminal, Cyberpunk Neon, CGA Retro PC, ZX Spectrum Vintage, and Lo-Fi 12fps Anime Hold).
-- Authentic CRT Phosphor Glow / Bloom: Fast separable box-blurred phosphor bloom pass with Screen and Additive blending modes.
 - Expanded Retro Color Palettes: 12 color modes including Original Colors, Cyber Lime, Solid Neon Cyber Lime, Matrix Green (#00FF66), Cyberpunk Neon (Cyan/Pink), CGA 4-Color, ZX Spectrum 16-Color, Monochrome Green/Amber/White, Pure 1-Bit Binary B&W, and Luminance Grayscale.
 - Pre-compiled & Standalone: Ready-to-use binaries for Windows (x64) and Linux (x86_64). Zero external runtime dependencies.
 - Font Engines:
@@ -101,10 +100,6 @@ To uninstall, run `./uninstall.sh` or remove `AsciiArt.ofx.bundle` from the targ
 | **Character Set** | Dropdown | Presets: Goliath (22 visible), Standard, Detailed (70+), Blocks, Dense, Minimal, Binary, or Custom Ramp. |
 | **Custom Ramp** | String | User-defined ramp string when Character Set is set to Custom Ramp. |
 | **Color Mode** | Dropdown | 12 modes: Original, Cyber Lime, Solid Cyber Lime, Matrix Green (#00FF66), Cyberpunk Neon, CGA Mode (4-Color), ZX Spectrum (16-Color), Mono Green, Mono Amber, Mono White, Pure 1-Bit B&W, and Luminance Grayscale. |
-| **CRT Phosphor Glow** | Toggle | Enables authentic CRT phosphor bloom and bleed. |
-| **Glow Radius** | Slider | Spread radius of phosphor bloom in pixels (1 - 30). |
-| **Glow Intensity** | Slider | Brightness and prominence of phosphor glow. |
-| **Glow Blend Mode** | Dropdown | Screen (Soft Bloom) or Additive (Vibrant/Hot). |
 | **BG Red / Green / Blue** | Sliders | Background fill color behind characters. |
 | **Contrast / Brightness** | Sliders | Pre-render input luminance adjustments. |
 | **Invert** | Toggle | Inverts luminance ramp mapping. |

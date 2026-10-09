@@ -670,11 +670,12 @@ static OfxStatus actionDescribeInContext(OfxImageEffectHandle effect, OfxPropert
     gPropSuite->propSetString(pp, kOfxParamPropChoiceOption, 10, "Pure 1-Bit (Strict B&W Binary)");
     gPropSuite->propSetString(pp, kOfxParamPropChoiceOption, 11, "Luminance Grayscale");
 
-    // CRT Phosphor Glow
+#if 0
+    // CRT Phosphor Glow (implementation retained in build, hidden from UI)
     gParamSuite->paramDefine(ps, kOfxParamTypeBoolean, PARAM_ENABLE_GLOW, &pp);
     gPropSuite->propSetString(pp, kOfxPropLabel, 0, "CRT Phosphor Glow");
     gPropSuite->propSetString(pp, kOfxParamPropHint, 0, "Enable authentic CRT phosphor bloom and soft bleeding");
-    gPropSuite->propSetInt(pp, kOfxParamPropDefault, 0, 1);
+    gPropSuite->propSetInt(pp, kOfxParamPropDefault, 0, 0);
 
     gParamSuite->paramDefine(ps, kOfxParamTypeInteger, PARAM_GLOW_RADIUS, &pp);
     gPropSuite->propSetString(pp, kOfxPropLabel, 0, "Glow Radius");
@@ -700,6 +701,7 @@ static OfxStatus actionDescribeInContext(OfxImageEffectHandle effect, OfxPropert
     gPropSuite->propSetInt(pp, kOfxParamPropDefault, 0, 0);
     gPropSuite->propSetString(pp, kOfxParamPropChoiceOption, 0, "Screen (Soft Bloom)");
     gPropSuite->propSetString(pp, kOfxParamPropChoiceOption, 1, "Additive (Vibrant/Hot)");
+#endif
 
     // Background R/G/B
     gParamSuite->paramDefine(ps, kOfxParamTypeDouble, PARAM_BG_R, &pp);
@@ -843,10 +845,17 @@ static OfxStatus actionCreateInstance(OfxImageEffectHandle effect) {
     gParamSuite->paramGetHandle(ps, PARAM_SKIP_BLACK, &d->skipBlackParam, nullptr);
     gParamSuite->paramGetHandle(ps, PARAM_BLACK_CUTOFF, &d->blackCutoffParam, nullptr);
     gParamSuite->paramGetHandle(ps, PARAM_ALPHA_CUTOFF, &d->alphaCutoffParam, nullptr);
+#if 0
     gParamSuite->paramGetHandle(ps, PARAM_ENABLE_GLOW, &d->enableGlowParam, nullptr);
     gParamSuite->paramGetHandle(ps, PARAM_GLOW_RADIUS, &d->glowRadiusParam, nullptr);
     gParamSuite->paramGetHandle(ps, PARAM_GLOW_INTENSITY, &d->glowIntensityParam, nullptr);
     gParamSuite->paramGetHandle(ps, PARAM_GLOW_BLEND_MODE, &d->glowBlendModeParam, nullptr);
+#else
+    d->enableGlowParam = nullptr;
+    d->glowRadiusParam = nullptr;
+    d->glowIntensityParam = nullptr;
+    d->glowBlendModeParam = nullptr;
+#endif
     gParamSuite->paramGetHandle(ps, PARAM_FRAME_HOLD, &d->frameHoldParam, nullptr);
     d->lastRenderedFrame = -999999;
     d->hasCachedOutput = false;
