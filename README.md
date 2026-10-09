@@ -29,7 +29,7 @@ High-performance OpenFX (OFX) image effect plugin for DaVinci Resolve and other 
 ## Downloads
 
 Download the latest pre-compiled binaries:
-- [AsciiArt_OFX_Windows.zip](https://github.com/SKBwastaken/ASCIICreatorOFX/releases/download/v1.3.0/AsciiArt_OFX_Windows.zip) (Windows x64 - Includes 1-Click `Install.bat` and `Update.bat`)
+- [AsciiArt_OFX_Windows.zip](https://github.com/SKBwastaken/ASCIICreatorOFX/releases/download/v1.3.1/AsciiArt_OFX_Windows.zip) (Windows x64 - Includes 1-Click `Install.bat` and `Update.bat`)
 - [AsciiArt_OFX_Linux.zip](https://github.com/SKBwastaken/ASCIICreatorOFX/releases/download/v1.2.0/AsciiArt_OFX_Linux.zip) (Linux x86_64 - Includes `install.sh`)
 
 View all releases: [Releases Page](https://github.com/SKBwastaken/ASCIICreatorOFX/releases)
