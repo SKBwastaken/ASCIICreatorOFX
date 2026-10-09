@@ -41,16 +41,17 @@
 // Plugin identity
 // ============================================================================
 #define PLUGIN_ID "com.skb.asciiart"
-#define PLUGIN_NAME "ASCII Art"
+#define PLUGIN_NAME "ASCII"
 #define PLUGIN_GROUP "Stylize"
 #define PLUGIN_VERSION_MAJOR 1
-#define PLUGIN_VERSION_MINOR 2
-#define PLUGIN_BUILD_NUMBER  10
-#define PLUGIN_VERSION_STR   "v1.2 (Build 10)"
+#define PLUGIN_VERSION_MINOR 3
+#define PLUGIN_BUILD_NUMBER  11
+#define PLUGIN_VERSION_STR   "v1.3 (Build 11)"
 
 // ============================================================================
 // Parameter IDs
 // ============================================================================
+#define PARAM_PRESET          "preset"
 #define PARAM_CHAR_SPACING    "charSpacing"
 #define PARAM_CHAR_ASPECT     "charAspect"
 #define PARAM_FONT_SOURCE     "fontSource"
@@ -70,6 +71,10 @@
 #define PARAM_SKIP_BLACK      "skipBlack"
 #define PARAM_BLACK_CUTOFF    "blackCutoff"
 #define PARAM_ALPHA_CUTOFF    "alphaCutoff"
+#define PARAM_ENABLE_GLOW     "enableGlow"
+#define PARAM_GLOW_RADIUS     "glowRadius"
+#define PARAM_GLOW_INTENSITY  "glowIntensity"
+#define PARAM_GLOW_BLEND_MODE "glowBlendMode"
 #define PARAM_FRAME_HOLD      "frameHold"
 #define PARAM_BUILD_INFO      "buildInfo"
 #define PARAM_INFO_BUTTON     "infoButton"
@@ -266,6 +271,7 @@ struct FontCache {
 struct InstanceData {
     OfxImageClipHandle sourceClip;
     OfxImageClipHandle outputClip;
+    OfxParamHandle presetParam;
     OfxParamHandle charSpacingParam;
     OfxParamHandle charAspectParam;
     OfxParamHandle fontSourceParam;
@@ -283,17 +289,27 @@ struct InstanceData {
     OfxParamHandle skipBlackParam;
     OfxParamHandle blackCutoffParam;
     OfxParamHandle alphaCutoffParam;
+    OfxParamHandle enableGlowParam;
+    OfxParamHandle glowRadiusParam;
+    OfxParamHandle glowIntensityParam;
+    OfxParamHandle glowBlendModeParam;
     OfxParamHandle frameHoldParam;
     FontCache fontCache;
     unsigned char* renderBuffer;
     size_t renderBufferSize;
+    unsigned char* glowBuffer;
+    size_t glowBufferSize;
+    unsigned char* blurBuffer;
+    size_t blurBufferSize;
+    unsigned char* blurTemp;
+    size_t blurTempSize;
     long long lastRenderedFrame;
     bool hasCachedOutput;
     int lastRenderW, lastRenderH, lastRenderNcomp;
 };
 
 // ============================================================================
-// Helpers
+// Helpers & Palettes
 // ============================================================================
 static InstanceData* getInstanceData(OfxImageEffectHandle effect) {
     OfxPropertySetHandle effectProps;
@@ -310,13 +326,116 @@ static inline double clampD(double v, double lo, double hi) {
     return v < lo ? lo : (v > hi ? hi : v);
 }
 
+// Retro Palettes
+static const unsigned char CGA_PALETTE[4][3] = {
+    {0, 0, 0},
+    {85, 255, 255},
+    {255, 85, 255},
+    {255, 255, 255}
+};
+
+static const unsigned char ZX_SPECTRUM_PALETTE[16][3] = {
+    {0,   0,   0},   {0,   0,   192}, {192, 0,   0},   {192, 0,   192},
+    {0,   192, 0},   {0,   192, 192}, {192, 192, 0},   {192, 192, 192},
+    {0,   0,   0},   {0,   0,   255}, {255, 0,   0},   {255, 0,   255},
+    {0,   255, 0},   {0,   255, 255}, {255, 255, 0},   {255, 255, 255}
+};
+
+static inline void matchNearestPalette(int r, int g, int b, const unsigned char pal[][3], int count,
+                                       unsigned char& outR, unsigned char& outG, unsigned char& outB) {
+    int bestDist = 99999999;
+    int bestIdx = 0;
+    for (int i = 0; i < count; i++) {
+        int dr = r - pal[i][0];
+        int dg = g - pal[i][1];
+        int db = b - pal[i][2];
+        int dist = dr * dr + dg * dg + db * db;
+        if (dist < bestDist) {
+            bestDist = dist;
+            bestIdx = i;
+        }
+    }
+    outR = pal[bestIdx][0];
+    outG = pal[bestIdx][1];
+    outB = pal[bestIdx][2];
+}
+
+// Fast separable box blur for real-time phosphor bloom
+static void fastBoxBlur(const unsigned char* src, unsigned char* dst, unsigned char* temp,
+                        int w, int h, int ncomp, int radius) {
+    if (radius <= 0) {
+        memcpy(dst, src, (size_t)w * h * ncomp);
+        return;
+    }
+    int div = 2 * radius + 1;
+
+    // Horizontal pass: src -> temp
+#if defined(_OPENMP)
+    #pragma omp parallel for schedule(static)
+#endif
+    for (int y = 0; y < h; y++) {
+        const unsigned char* srow = src + y * w * ncomp;
+        unsigned char* trow = temp + y * w * ncomp;
+        int sum[4] = {0, 0, 0, 0};
+
+        for (int i = -radius; i <= radius; i++) {
+            int cx = clampI(i, 0, w - 1);
+            for (int c = 0; c < ncomp; c++) {
+                sum[c] += srow[cx * ncomp + c];
+            }
+        }
+
+        for (int x = 0; x < w; x++) {
+            for (int c = 0; c < ncomp; c++) {
+                trow[x * ncomp + c] = (unsigned char)(sum[c] / div);
+            }
+            int xOut = clampI(x - radius, 0, w - 1);
+            int xIn  = clampI(x + radius + 1, 0, w - 1);
+            for (int c = 0; c < ncomp; c++) {
+                sum[c] += srow[xIn * ncomp + c] - srow[xOut * ncomp + c];
+            }
+        }
+    }
+
+    // Vertical pass: temp -> dst
+#if defined(_OPENMP)
+    #pragma omp parallel for schedule(static)
+#endif
+    for (int x = 0; x < w; x++) {
+        int sum[4] = {0, 0, 0, 0};
+
+        for (int i = -radius; i <= radius; i++) {
+            int cy = clampI(i, 0, h - 1);
+            const unsigned char* p = temp + (cy * w + x) * ncomp;
+            for (int c = 0; c < ncomp; c++) {
+                sum[c] += p[c];
+            }
+        }
+
+        for (int y = 0; y < h; y++) {
+            unsigned char* d = dst + (y * w + x) * ncomp;
+            for (int c = 0; c < ncomp; c++) {
+                d[c] = (unsigned char)(sum[c] / div);
+            }
+            int yOut = clampI(y - radius, 0, h - 1);
+            int yIn  = clampI(y + radius + 1, 0, h - 1);
+            const unsigned char* pIn  = temp + (yIn * w + x) * ncomp;
+            const unsigned char* pOut = temp + (yOut * w + x) * ncomp;
+            for (int c = 0; c < ncomp; c++) {
+                sum[c] += pIn[c] - pOut[c];
+            }
+        }
+    }
+}
+
 // ============================================================================
 // Draw fallback bitmap glyph (Consolas 8x16)
 // ============================================================================
 static void drawFallbackGlyph(unsigned char* buf, int bufW, int bufH, int ncomp,
                               int cx, int cy, int cw, int ch_,
                               int charCode, double fscale,
-                              unsigned char fR, unsigned char fG, unsigned char fB) {
+                              unsigned char fR, unsigned char fG, unsigned char fB,
+                              unsigned char* glowBuf = nullptr) {
     if (charCode < GLYPH_FIRST || charCode > GLYPH_LAST) return;
     const unsigned char* glyph = FALLBACK_FONT[charCode - GLYPH_FIRST];
 
@@ -345,6 +464,12 @@ static void drawFallbackGlyph(unsigned char* buf, int bufW, int bufH, int ncomp,
                 buf[idx + 1] = fG;
                 buf[idx + 2] = fB;
                 if (ncomp >= 4) buf[idx + 3] = 255;
+                if (glowBuf) {
+                    glowBuf[idx + 0] = fR;
+                    glowBuf[idx + 1] = fG;
+                    glowBuf[idx + 2] = fB;
+                    if (ncomp >= 4) glowBuf[idx + 3] = 255;
+                }
             }
         }
     }
@@ -356,7 +481,8 @@ static void drawFallbackGlyph(unsigned char* buf, int bufW, int bufH, int ncomp,
 static void drawStbGlyph(unsigned char* buf, int bufW, int bufH, int ncomp,
                          int cx, int cy, int cw, int ch_,
                          FontCache& fc, int charCode, double fscale,
-                         unsigned char fR, unsigned char fG, unsigned char fB) {
+                         unsigned char fR, unsigned char fG, unsigned char fB,
+                         unsigned char* glowBuf = nullptr) {
     if (charCode < 32 || charCode > 126) return;
     GlyphBitmap& gb = fc.glyphs[charCode];
     if (!gb.pixels || gb.w == 0 || gb.h == 0) return;
@@ -386,6 +512,21 @@ static void drawStbGlyph(unsigned char* buf, int bufW, int bufH, int ncomp,
                 dst[2] = (unsigned char)((fB * a + dst[2] * invA + 127) / 255);
             }
             if (ncomp >= 4) dst[3] = 255;
+
+            if (glowBuf) {
+                unsigned char* gdst = glowBuf + (outY * bufW + outX) * ncomp;
+                if (alpha >= 250) {
+                    gdst[0] = fR;
+                    gdst[1] = fG;
+                    gdst[2] = fB;
+                } else {
+                    unsigned int a = alpha;
+                    gdst[0] = (unsigned char)((fR * a + 127) / 255);
+                    gdst[1] = (unsigned char)((fG * a + 127) / 255);
+                    gdst[2] = (unsigned char)((fB * a + 127) / 255);
+                }
+                if (ncomp >= 4) gdst[3] = 255;
+            }
         }
     }
 }
@@ -440,11 +581,26 @@ static OfxStatus actionDescribeInContext(OfxImageEffectHandle effect, OfxPropert
     gEffectSuite->getParamSet(effect, &ps);
     OfxPropertySetHandle pp;
 
+    // Preset Selection (Quick Curated Looks)
+    gParamSuite->paramDefine(ps, kOfxParamTypeChoice, PARAM_PRESET, &pp);
+    gPropSuite->propSetString(pp, kOfxPropLabel, 0, "Preset");
+    gPropSuite->propSetString(pp, kOfxParamPropHint, 0, "Select curated style preset to instantly configure all parameters");
+    gPropSuite->propSetInt(pp, kOfxParamPropDefault, 0, 1);
+    gPropSuite->propSetString(pp, kOfxParamPropChoiceOption, 0, "Custom / Manual");
+    gPropSuite->propSetString(pp, kOfxParamPropChoiceOption, 1, "Classic Matrix CRT (Default)");
+    gPropSuite->propSetString(pp, kOfxParamPropChoiceOption, 2, "Goliath Cyber Lime");
+    gPropSuite->propSetString(pp, kOfxParamPropChoiceOption, 3, "Full Color Hi-Fi");
+    gPropSuite->propSetString(pp, kOfxParamPropChoiceOption, 4, "Pure 1-Bit Terminal");
+    gPropSuite->propSetString(pp, kOfxParamPropChoiceOption, 5, "Cyberpunk Neon");
+    gPropSuite->propSetString(pp, kOfxParamPropChoiceOption, 6, "CGA Retro PC");
+    gPropSuite->propSetString(pp, kOfxParamPropChoiceOption, 7, "ZX Spectrum Vintage");
+    gPropSuite->propSetString(pp, kOfxParamPropChoiceOption, 8, "Lo-Fi 12fps Anime Hold");
+
     // Character Spacing (the single unified slider for spacing and density!)
     gParamSuite->paramDefine(ps, kOfxParamTypeInteger, PARAM_CHAR_SPACING, &pp);
     gPropSuite->propSetString(pp, kOfxPropLabel, 0, "Character Spacing");
     gPropSuite->propSetString(pp, kOfxParamPropHint, 0, "Consistent spacing between characters in pixels (lower = higher resolution, higher = larger characters)");
-    gPropSuite->propSetInt(pp, kOfxParamPropDefault, 0, 14);
+    gPropSuite->propSetInt(pp, kOfxParamPropDefault, 0, 25);
     gPropSuite->propSetInt(pp, kOfxParamPropMin, 0, 2);
     gPropSuite->propSetInt(pp, kOfxParamPropMax, 0, 300);
     gPropSuite->propSetInt(pp, kOfxParamPropDisplayMin, 0, 2);
@@ -461,13 +617,14 @@ static OfxStatus actionDescribeInContext(OfxImageEffectHandle effect, OfxPropert
     gPropSuite->propSetDouble(pp, kOfxParamPropDisplayMax, 0, 2.0);
     gPropSuite->propSetDouble(pp, kOfxParamPropIncrement, 0, 0.05);
 
-    // Font Source Dropdown (Goliath is default!)
+    // Font Source Dropdown
     gParamSuite->paramDefine(ps, kOfxParamTypeChoice, PARAM_FONT_SOURCE, &pp);
     gPropSuite->propSetString(pp, kOfxPropLabel, 0, "Font Source");
-    gPropSuite->propSetInt(pp, kOfxParamPropDefault, 0, 0);
+    gPropSuite->propSetInt(pp, kOfxParamPropDefault, 0, 3);
     gPropSuite->propSetString(pp, kOfxParamPropChoiceOption, 0, "Goliath Encrypted (Auto-detect)");
-    gPropSuite->propSetString(pp, kOfxParamPropChoiceOption, 1, "Built-in Monospace");
-    gPropSuite->propSetString(pp, kOfxParamPropChoiceOption, 2, "Custom Font File (Browse...)");
+    gPropSuite->propSetString(pp, kOfxParamPropChoiceOption, 1, "Consolas Monospace (Bundled)");
+    gPropSuite->propSetString(pp, kOfxParamPropChoiceOption, 2, "Built-in Monospace");
+    gPropSuite->propSetString(pp, kOfxParamPropChoiceOption, 3, "Custom Font File (Browse...)");
 
     // Font File Path (with native file picker!)
     gParamSuite->paramDefine(ps, kOfxParamTypeString, PARAM_FONT_FILE, &pp);
@@ -475,12 +632,12 @@ static OfxStatus actionDescribeInContext(OfxImageEffectHandle effect, OfxPropert
     gPropSuite->propSetString(pp, kOfxParamPropHint, 0, "Select a .ttf or .otf font file");
     gPropSuite->propSetString(pp, kOfxParamPropStringMode, 0, kOfxParamStringIsFilePath);
     gPropSuite->propSetInt(pp, kOfxParamPropStringFilePathExists, 0, 1);
-    gPropSuite->propSetString(pp, kOfxParamPropDefault, 0, "");
+    gPropSuite->propSetString(pp, kOfxParamPropDefault, 0, "C:\\Users\\SKB\\Downloads\\Consolas-Regular.ttf");
 
-    // Character Set (Goliath 22 Glyphs is default!)
+    // Character Set
     gParamSuite->paramDefine(ps, kOfxParamTypeChoice, PARAM_CHAR_SET, &pp);
     gPropSuite->propSetString(pp, kOfxPropLabel, 0, "Character Set");
-    gPropSuite->propSetInt(pp, kOfxParamPropDefault, 0, 0);
+    gPropSuite->propSetInt(pp, kOfxParamPropDefault, 0, 2);
     gPropSuite->propSetString(pp, kOfxParamPropChoiceOption, 0, "Goliath (22 Visible Glyphs)");
     gPropSuite->propSetString(pp, kOfxParamPropChoiceOption, 1, "Standard (.:-=+*#%@)");
     gPropSuite->propSetString(pp, kOfxParamPropChoiceOption, 2, "Detailed (70+ Chars)");
@@ -496,41 +653,77 @@ static OfxStatus actionDescribeInContext(OfxImageEffectHandle effect, OfxPropert
     gPropSuite->propSetString(pp, kOfxParamPropHint, 0, "Only used when Character Set is set to 'Custom Ramp'");
     gPropSuite->propSetString(pp, kOfxParamPropDefault, 0, " .:-=+*#%@");
 
-    // Color Mode
+    // Color Mode (Expanded retro palettes)
     gParamSuite->paramDefine(ps, kOfxParamTypeChoice, PARAM_COLOR_MODE, &pp);
     gPropSuite->propSetString(pp, kOfxPropLabel, 0, "Color Mode");
     gPropSuite->propSetInt(pp, kOfxParamPropDefault, 0, 0);
     gPropSuite->propSetString(pp, kOfxParamPropChoiceOption, 0, "Original Colors");
     gPropSuite->propSetString(pp, kOfxParamPropChoiceOption, 1, "Cyber Lime (#C2FD04) on Black");
     gPropSuite->propSetString(pp, kOfxParamPropChoiceOption, 2, "Solid Cyber Lime (Punchy Neon)");
-    gPropSuite->propSetString(pp, kOfxParamPropChoiceOption, 3, "Mono Green (Matrix)");
-    gPropSuite->propSetString(pp, kOfxParamPropChoiceOption, 4, "Mono Amber");
-    gPropSuite->propSetString(pp, kOfxParamPropChoiceOption, 5, "Mono White");
-    gPropSuite->propSetString(pp, kOfxParamPropChoiceOption, 6, "Luminance Grayscale");
+    gPropSuite->propSetString(pp, kOfxParamPropChoiceOption, 3, "Matrix Green (#00FF66)");
+    gPropSuite->propSetString(pp, kOfxParamPropChoiceOption, 4, "Cyberpunk Neon (Cyan/Pink)");
+    gPropSuite->propSetString(pp, kOfxParamPropChoiceOption, 5, "CGA Mode (4-Color Retro)");
+    gPropSuite->propSetString(pp, kOfxParamPropChoiceOption, 6, "ZX Spectrum 16-Color");
+    gPropSuite->propSetString(pp, kOfxParamPropChoiceOption, 7, "Mono Green (Matrix)");
+    gPropSuite->propSetString(pp, kOfxParamPropChoiceOption, 8, "Mono Amber");
+    gPropSuite->propSetString(pp, kOfxParamPropChoiceOption, 9, "Mono White");
+    gPropSuite->propSetString(pp, kOfxParamPropChoiceOption, 10, "Pure 1-Bit (Strict B&W Binary)");
+    gPropSuite->propSetString(pp, kOfxParamPropChoiceOption, 11, "Luminance Grayscale");
+
+    // CRT Phosphor Glow
+    gParamSuite->paramDefine(ps, kOfxParamTypeBoolean, PARAM_ENABLE_GLOW, &pp);
+    gPropSuite->propSetString(pp, kOfxPropLabel, 0, "CRT Phosphor Glow");
+    gPropSuite->propSetString(pp, kOfxParamPropHint, 0, "Enable authentic CRT phosphor bloom and soft bleeding");
+    gPropSuite->propSetInt(pp, kOfxParamPropDefault, 0, 1);
+
+    gParamSuite->paramDefine(ps, kOfxParamTypeInteger, PARAM_GLOW_RADIUS, &pp);
+    gPropSuite->propSetString(pp, kOfxPropLabel, 0, "Glow Radius");
+    gPropSuite->propSetString(pp, kOfxParamPropHint, 0, "Spread radius of phosphor glow in pixels");
+    gPropSuite->propSetInt(pp, kOfxParamPropDefault, 0, 8);
+    gPropSuite->propSetInt(pp, kOfxParamPropMin, 0, 1);
+    gPropSuite->propSetInt(pp, kOfxParamPropMax, 0, 30);
+    gPropSuite->propSetInt(pp, kOfxParamPropDisplayMin, 0, 1);
+    gPropSuite->propSetInt(pp, kOfxParamPropDisplayMax, 0, 20);
+
+    gParamSuite->paramDefine(ps, kOfxParamTypeDouble, PARAM_GLOW_INTENSITY, &pp);
+    gPropSuite->propSetString(pp, kOfxPropLabel, 0, "Glow Intensity");
+    gPropSuite->propSetString(pp, kOfxParamPropHint, 0, "Brightness and strength of phosphor glow");
+    gPropSuite->propSetDouble(pp, kOfxParamPropDefault, 0, 0.85);
+    gPropSuite->propSetDouble(pp, kOfxParamPropMin, 0, 0.0);
+    gPropSuite->propSetDouble(pp, kOfxParamPropMax, 0, 2.0);
+    gPropSuite->propSetDouble(pp, kOfxParamPropDisplayMin, 0, 0.0);
+    gPropSuite->propSetDouble(pp, kOfxParamPropDisplayMax, 0, 1.5);
+
+    gParamSuite->paramDefine(ps, kOfxParamTypeChoice, PARAM_GLOW_BLEND_MODE, &pp);
+    gPropSuite->propSetString(pp, kOfxPropLabel, 0, "Glow Blend Mode");
+    gPropSuite->propSetString(pp, kOfxParamPropHint, 0, "Screen for soft phosphor bloom, Additive for intense neon saturation");
+    gPropSuite->propSetInt(pp, kOfxParamPropDefault, 0, 0);
+    gPropSuite->propSetString(pp, kOfxParamPropChoiceOption, 0, "Screen (Soft Bloom)");
+    gPropSuite->propSetString(pp, kOfxParamPropChoiceOption, 1, "Additive (Vibrant/Hot)");
 
     // Background R/G/B
     gParamSuite->paramDefine(ps, kOfxParamTypeDouble, PARAM_BG_R, &pp);
     gPropSuite->propSetString(pp, kOfxPropLabel, 0, "BG Red");
-    gPropSuite->propSetDouble(pp, kOfxParamPropDefault, 0, 0.0);
+    gPropSuite->propSetDouble(pp, kOfxParamPropDefault, 0, 0.01);
     gPropSuite->propSetDouble(pp, kOfxParamPropMin, 0, 0.0);
     gPropSuite->propSetDouble(pp, kOfxParamPropMax, 0, 1.0);
 
     gParamSuite->paramDefine(ps, kOfxParamTypeDouble, PARAM_BG_G, &pp);
     gPropSuite->propSetString(pp, kOfxPropLabel, 0, "BG Green");
-    gPropSuite->propSetDouble(pp, kOfxParamPropDefault, 0, 0.0);
+    gPropSuite->propSetDouble(pp, kOfxParamPropDefault, 0, 0.03);
     gPropSuite->propSetDouble(pp, kOfxParamPropMin, 0, 0.0);
     gPropSuite->propSetDouble(pp, kOfxParamPropMax, 0, 1.0);
 
     gParamSuite->paramDefine(ps, kOfxParamTypeDouble, PARAM_BG_B, &pp);
     gPropSuite->propSetString(pp, kOfxPropLabel, 0, "BG Blue");
-    gPropSuite->propSetDouble(pp, kOfxParamPropDefault, 0, 0.0);
+    gPropSuite->propSetDouble(pp, kOfxParamPropDefault, 0, 0.01);
     gPropSuite->propSetDouble(pp, kOfxParamPropMin, 0, 0.0);
     gPropSuite->propSetDouble(pp, kOfxParamPropMax, 0, 1.0);
 
     // Contrast
     gParamSuite->paramDefine(ps, kOfxParamTypeDouble, PARAM_CONTRAST, &pp);
     gPropSuite->propSetString(pp, kOfxPropLabel, 0, "Contrast");
-    gPropSuite->propSetDouble(pp, kOfxParamPropDefault, 0, 0.0);
+    gPropSuite->propSetDouble(pp, kOfxParamPropDefault, 0, 30.0);
     gPropSuite->propSetDouble(pp, kOfxParamPropMin, 0, -100.0);
     gPropSuite->propSetDouble(pp, kOfxParamPropMax, 0, 100.0);
     gPropSuite->propSetDouble(pp, kOfxParamPropDisplayMin, 0, -100.0);
@@ -539,7 +732,7 @@ static OfxStatus actionDescribeInContext(OfxImageEffectHandle effect, OfxPropert
     // Brightness
     gParamSuite->paramDefine(ps, kOfxParamTypeDouble, PARAM_BRIGHTNESS, &pp);
     gPropSuite->propSetString(pp, kOfxPropLabel, 0, "Brightness");
-    gPropSuite->propSetDouble(pp, kOfxParamPropDefault, 0, 0.0);
+    gPropSuite->propSetDouble(pp, kOfxParamPropDefault, 0, 10.0);
     gPropSuite->propSetDouble(pp, kOfxParamPropMin, 0, -100.0);
     gPropSuite->propSetDouble(pp, kOfxParamPropMax, 0, 100.0);
     gPropSuite->propSetDouble(pp, kOfxParamPropDisplayMin, 0, -100.0);
@@ -559,7 +752,7 @@ static OfxStatus actionDescribeInContext(OfxImageEffectHandle effect, OfxPropert
     gParamSuite->paramDefine(ps, kOfxParamTypeDouble, PARAM_FONT_SCALE, &pp);
     gPropSuite->propSetString(pp, kOfxPropLabel, 0, "Font Scale");
     gPropSuite->propSetString(pp, kOfxParamPropHint, 0, "Scale of glyph within cell");
-    gPropSuite->propSetDouble(pp, kOfxParamPropDefault, 0, 0.92);
+    gPropSuite->propSetDouble(pp, kOfxParamPropDefault, 0, 1.0);
     gPropSuite->propSetDouble(pp, kOfxParamPropMin, 0, 0.3);
     gPropSuite->propSetDouble(pp, kOfxParamPropMax, 0, 2.0);
     gPropSuite->propSetDouble(pp, kOfxParamPropDisplayMin, 0, 0.3);
@@ -608,10 +801,10 @@ static OfxStatus actionDescribeInContext(OfxImageEffectHandle effect, OfxPropert
     gPropSuite->propSetInt(pp, kOfxParamPropDisplayMin, 0, 1);
     gPropSuite->propSetInt(pp, kOfxParamPropDisplayMax, 0, 12);
 
-    // About / Info Push Button (Opens https://therealskb.carrd.co/)
+    // About / Info Push Button (Opens GitHub)
     gParamSuite->paramDefine(ps, kOfxParamTypePushButton, PARAM_INFO_BUTTON, &pp);
-    gPropSuite->propSetString(pp, kOfxPropLabel, 0, "About: ASCII Art " PLUGIN_VERSION_STR);
-    gPropSuite->propSetString(pp, kOfxParamPropHint, 0, "Visit https://therealskb.carrd.co/");
+    gPropSuite->propSetString(pp, kOfxPropLabel, 0, "ASCII " PLUGIN_VERSION_STR " - GitHub");
+    gPropSuite->propSetString(pp, kOfxParamPropHint, 0, "Visit https://github.com/SKBwastaken/ASCIICreatorOFX");
 
     return kOfxStatOK;
 }
@@ -630,6 +823,7 @@ static OfxStatus actionCreateInstance(OfxImageEffectHandle effect) {
 
     OfxParamSetHandle ps;
     gEffectSuite->getParamSet(effect, &ps);
+    gParamSuite->paramGetHandle(ps, PARAM_PRESET, &d->presetParam, nullptr);
     gParamSuite->paramGetHandle(ps, PARAM_CHAR_SPACING, &d->charSpacingParam, nullptr);
     gParamSuite->paramGetHandle(ps, PARAM_CHAR_ASPECT, &d->charAspectParam, nullptr);
     gParamSuite->paramGetHandle(ps, PARAM_FONT_SOURCE, &d->fontSourceParam, nullptr);
@@ -649,6 +843,10 @@ static OfxStatus actionCreateInstance(OfxImageEffectHandle effect) {
     gParamSuite->paramGetHandle(ps, PARAM_SKIP_BLACK, &d->skipBlackParam, nullptr);
     gParamSuite->paramGetHandle(ps, PARAM_BLACK_CUTOFF, &d->blackCutoffParam, nullptr);
     gParamSuite->paramGetHandle(ps, PARAM_ALPHA_CUTOFF, &d->alphaCutoffParam, nullptr);
+    gParamSuite->paramGetHandle(ps, PARAM_ENABLE_GLOW, &d->enableGlowParam, nullptr);
+    gParamSuite->paramGetHandle(ps, PARAM_GLOW_RADIUS, &d->glowRadiusParam, nullptr);
+    gParamSuite->paramGetHandle(ps, PARAM_GLOW_INTENSITY, &d->glowIntensityParam, nullptr);
+    gParamSuite->paramGetHandle(ps, PARAM_GLOW_BLEND_MODE, &d->glowBlendModeParam, nullptr);
     gParamSuite->paramGetHandle(ps, PARAM_FRAME_HOLD, &d->frameHoldParam, nullptr);
     d->lastRenderedFrame = -999999;
     d->hasCachedOutput = false;
@@ -667,6 +865,9 @@ static OfxStatus actionDestroyInstance(OfxImageEffectHandle effect) {
     if (d) {
         d->fontCache.clear();
         if (d->renderBuffer) { free(d->renderBuffer); d->renderBuffer = nullptr; }
+        if (d->glowBuffer) { free(d->glowBuffer); d->glowBuffer = nullptr; }
+        if (d->blurBuffer) { free(d->blurBuffer); d->blurBuffer = nullptr; }
+        if (d->blurTemp) { free(d->blurTemp); d->blurTemp = nullptr; }
         delete d;
     }
     return kOfxStatOK;
@@ -703,6 +904,10 @@ static OfxStatus actionRender(OfxImageEffectHandle effect, OfxPropertySetHandle 
     int skipBlack = 1; if (d->skipBlackParam) gParamSuite->paramGetValueAtTime(d->skipBlackParam, time, &skipBlack);
     double blackCutoff = 15.0; if (d->blackCutoffParam) gParamSuite->paramGetValueAtTime(d->blackCutoffParam, time, &blackCutoff);
     double alphaCutoff = 10.0; if (d->alphaCutoffParam) gParamSuite->paramGetValueAtTime(d->alphaCutoffParam, time, &alphaCutoff);
+    int enableGlow = 0; if (d->enableGlowParam) gParamSuite->paramGetValueAtTime(d->enableGlowParam, time, &enableGlow);
+    int glowRadius = 6; if (d->glowRadiusParam) gParamSuite->paramGetValueAtTime(d->glowRadiusParam, time, &glowRadius);
+    double glowIntensity = 0.60; if (d->glowIntensityParam) gParamSuite->paramGetValueAtTime(d->glowIntensityParam, time, &glowIntensity);
+    int glowBlendMode = 0; if (d->glowBlendModeParam) gParamSuite->paramGetValueAtTime(d->glowBlendModeParam, time, &glowBlendMode);
     int frameHold = 1; if (d->frameHoldParam) gParamSuite->paramGetValueAtTime(d->frameHoldParam, time, &frameHold);
     if (frameHold < 1) frameHold = 1;
 
@@ -759,27 +964,21 @@ static OfxStatus actionRender(OfxImageEffectHandle effect, OfxPropertySetHandle 
         return kOfxStatOK;
     }
 
-    // If Font Source is Goliath (0) OR Character Set is Goliath (0), use Goliath!
-    bool useGoliath = (fontSource == 0) || (charSetIdx == 0);
-
-    // Determine character ramp (default is Goliath!)
-    const char* ramp = RAMP_GOLIATH;
-    if (charSetIdx == 0 || (fontSource == 0 && charSetIdx == 0)) {
-        ramp = RAMP_GOLIATH;
-    } else {
-        switch (charSetIdx) {
-            case 1: ramp = RAMP_STANDARD; break;
-            case 2: ramp = RAMP_DETAILED; break;
-            case 3: ramp = RAMP_BLOCKS_ASCII; break;
-            case 4: ramp = RAMP_DENSE; break;
-            case 5: ramp = RAMP_MINIMAL; break;
-            case 6: ramp = RAMP_BINARY; break;
-            case 7: ramp = (customChars && strlen(customChars) > 0) ? customChars : RAMP_GOLIATH; break;
-            default: ramp = RAMP_GOLIATH; break;
-        }
+    // Determine character ramp
+    const char* ramp = RAMP_DETAILED;
+    switch (charSetIdx) {
+        case 0: ramp = RAMP_GOLIATH; break;
+        case 1: ramp = RAMP_STANDARD; break;
+        case 2: ramp = RAMP_DETAILED; break;
+        case 3: ramp = RAMP_BLOCKS_ASCII; break;
+        case 4: ramp = RAMP_DENSE; break;
+        case 5: ramp = RAMP_MINIMAL; break;
+        case 6: ramp = RAMP_BINARY; break;
+        case 7: ramp = (customChars && strlen(customChars) > 0) ? customChars : RAMP_STANDARD; break;
+        default: ramp = RAMP_DETAILED; break;
     }
     int rampLen = (int)strlen(ramp);
-    if (rampLen < 1) { ramp = RAMP_STANDARD; rampLen = (int)strlen(ramp); }
+    if (rampLen < 1) { ramp = RAMP_DETAILED; rampLen = (int)strlen(ramp); }
 
     // Non-space pool for random mode
     char nsPool[256]; int nsCount = 0;
@@ -800,7 +999,7 @@ static OfxStatus actionRender(OfxImageEffectHandle effect, OfxPropertySetHandle 
     bool useCustom = false;
     std::string fontToLoad = "";
 
-    if (fontSource == 2 && fontPath && strlen(fontPath) > 0) {
+    if (fontSource == 3 && fontPath && strlen(fontPath) > 0) {
         // User explicitly specified custom font path
         std::string cp = fontPath;
         if (cp.size() >= 2 && cp.front() == '"' && cp.back() == '"') {
@@ -809,7 +1008,19 @@ static OfxStatus actionRender(OfxImageEffectHandle effect, OfxPropertySetHandle 
         if (fileExists(cp.c_str())) {
             fontToLoad = cp;
         }
-    } else if (useGoliath) {
+    }
+
+    if (fontSource == 1 || (fontSource == 3 && fontToLoad.empty())) {
+        // Consolas (Bundled resource, Downloads, or Windows Fonts)
+        std::string resFont = getBundleResourcePath("Consolas-Regular.ttf");
+        if (!resFont.empty()) {
+            fontToLoad = resFont;
+        } else if (fileExists("C:\\Users\\SKB\\Downloads\\Consolas-Regular.ttf")) {
+            fontToLoad = "C:\\Users\\SKB\\Downloads\\Consolas-Regular.ttf";
+        } else if (fileExists("C:\\Windows\\Fonts\\consola.ttf")) {
+            fontToLoad = "C:\\Windows\\Fonts\\consola.ttf";
+        }
+    } else if (fontSource == 0) {
         // Goliath Auto-load (checks Bundle Resources, then Desktop, then Windows Fonts)
 #ifdef _WIN32
         std::string resFont = getBundleResourcePath("Goliath.ttf");
@@ -880,6 +1091,18 @@ static OfxStatus actionRender(OfxImageEffectHandle effect, OfxPropertySetHandle 
         }
     }
 
+    // Ensure glow emission buffer is allocated and cleared to 0 (isolated from background)
+    if (enableGlow) {
+        if (!d->glowBuffer || d->glowBufferSize < reqSize) {
+            if (d->glowBuffer) free(d->glowBuffer);
+            d->glowBufferSize = reqSize;
+            d->glowBuffer = (unsigned char*)malloc(reqSize);
+        }
+        if (d->glowBuffer) {
+            memset(d->glowBuffer, 0, reqSize);
+        }
+    }
+
     // Process grid in parallel across CPU cores
     unsigned char* srcBase = (unsigned char*)srcData;
 
@@ -940,29 +1163,117 @@ static OfxStatus actionRender(OfxImageEffectHandle effect, OfxPropertySetHandle 
 
             unsigned char fR, fG, fB;
             switch (colorMode) {
-                case 0: fR = (unsigned char)red; fG = (unsigned char)green; fB = (unsigned char)blue; break;
+                case 0: // Original Colors
+                    fR = (unsigned char)red; fG = (unsigned char)green; fB = (unsigned char)blue;
+                    break;
                 case 1: // Cyber Lime (#C2FD04 -> RGB 194, 253, 4 with luminance brightness)
-                        fR = (unsigned char)clampI((int)(194.0 * (lum / 255.0)), 0, 255);
-                        fG = (unsigned char)clampI((int)(253.0 * (lum / 255.0)), 0, 255);
-                        fB = (unsigned char)clampI((int)(4.0   * (lum / 255.0)), 0, 255);
-                        break;
+                    fR = (unsigned char)clampI((int)(194.0 * (lum / 255.0)), 0, 255);
+                    fG = (unsigned char)clampI((int)(253.0 * (lum / 255.0)), 0, 255);
+                    fB = (unsigned char)clampI((int)(4.0   * (lum / 255.0)), 0, 255);
+                    break;
                 case 2: // Solid Cyber Lime (punchy neon glow without dimming)
-                        fR = 194; fG = 253; fB = 4;
-                        break;
-                case 3: fR = 0; fG = (unsigned char)clampI((int)(lum * 0.9), 0, 230); fB = 0; break;
-                case 4: fR = (unsigned char)clampI((int)lum, 0, 255);
-                        fG = (unsigned char)clampI((int)(lum * 0.6), 0, 153); fB = 0; break;
-                case 5: fR = fG = fB = (unsigned char)clampI((int)lum, 0, 255); break;
-                case 6: fR = fG = fB = (unsigned char)clampI((int)lum, 0, 255); break;
-                default: fR = (unsigned char)red; fG = (unsigned char)green; fB = (unsigned char)blue; break;
+                    fR = 194; fG = 253; fB = 4;
+                    break;
+                case 3: // Matrix Green (#00FF66 -> RGB 0, 255, 102)
+                    fR = 0;
+                    fG = (unsigned char)clampI((int)(255.0 * (lum / 255.0)), 0, 255);
+                    fB = (unsigned char)clampI((int)(102.0 * (lum / 255.0)), 0, 255);
+                    break;
+                case 4: // Cyberpunk Neon (Cyan/Pink gradient based on luminance)
+                    {
+                        double t = lum / 255.0;
+                        fR = (unsigned char)clampI((int)(255.0 * t), 0, 255);
+                        fG = (unsigned char)clampI((int)(240.0 * (1.0 - t * 0.7)), 0, 255);
+                        fB = (unsigned char)clampI((int)(255.0 * (0.8 + 0.2 * t)), 0, 255);
+                    }
+                    break;
+                case 5: // CGA Mode (4-Color Retro)
+                    matchNearestPalette(red, green, blue, CGA_PALETTE, 4, fR, fG, fB);
+                    break;
+                case 6: // ZX Spectrum 16-Color
+                    matchNearestPalette(red, green, blue, ZX_SPECTRUM_PALETTE, 16, fR, fG, fB);
+                    break;
+                case 7: // Mono Green (Matrix)
+                    fR = 0;
+                    fG = (unsigned char)clampI((int)(lum * 0.9), 0, 230);
+                    fB = 0;
+                    break;
+                case 8: // Mono Amber
+                    fR = (unsigned char)clampI((int)lum, 0, 255);
+                    fG = (unsigned char)clampI((int)(lum * 0.6), 0, 153);
+                    fB = 0;
+                    break;
+                case 9: // Mono White
+                    fR = fG = fB = (unsigned char)clampI((int)lum, 0, 255);
+                    break;
+                case 10: // Pure 1-Bit (Strict B&W Binary)
+                    {
+                        unsigned char val = (lum > 127.0) ? 255 : 0;
+                        fR = fG = fB = val;
+                    }
+                    break;
+                case 11: // Luminance Grayscale
+                default:
+                    fR = fG = fB = (unsigned char)clampI((int)lum, 0, 255);
+                    break;
             }
 
             if (useCustom) {
                 drawStbGlyph(rb, dstW, dstH, ncomp, x0, y0, cellW, cellH,
-                             d->fontCache, (int)ch, fontScale, fR, fG, fB);
+                             d->fontCache, (int)ch, fontScale, fR, fG, fB,
+                             enableGlow ? d->glowBuffer : nullptr);
             } else {
                 drawFallbackGlyph(rb, dstW, dstH, ncomp, x0, y0, cellW, cellH,
-                                  (int)ch, fontScale, fR, fG, fB);
+                                  (int)ch, fontScale, fR, fG, fB,
+                                  enableGlow ? d->glowBuffer : nullptr);
+            }
+        }
+    }
+
+    // CRT Phosphor Glow Bloom pass (emanates ONLY from characters, NOT the entire background!)
+    if (enableGlow && glowRadius > 0 && glowIntensity > 0.01 && d->glowBuffer) {
+        if (!d->blurBuffer || d->blurBufferSize < reqSize) {
+            if (d->blurBuffer) free(d->blurBuffer);
+            d->blurBufferSize = reqSize;
+            d->blurBuffer = (unsigned char*)malloc(reqSize);
+        }
+        if (!d->blurTemp || d->blurTempSize < reqSize) {
+            if (d->blurTemp) free(d->blurTemp);
+            d->blurTempSize = reqSize;
+            d->blurTemp = (unsigned char*)malloc(reqSize);
+        }
+        if (d->blurBuffer && d->blurTemp) {
+            fastBoxBlur(d->glowBuffer, d->blurBuffer, d->blurTemp, dstW, dstH, ncomp, glowRadius);
+
+            double intensity = glowIntensity;
+            int totalPixels = dstW * dstH;
+
+#if defined(_OPENMP)
+            #pragma omp parallel for schedule(static)
+#endif
+            for (int i = 0; i < totalPixels; i++) {
+                int pxOffset = i * ncomp;
+                int b0 = d->blurBuffer[pxOffset + 0];
+                int b1 = d->blurBuffer[pxOffset + 1];
+                int b2 = d->blurBuffer[pxOffset + 2];
+                if ((b0 | b1 | b2) == 0) continue;
+
+                for (int c = 0; c < 3; c++) {
+                    int base = rb[pxOffset + c];
+                    int bloom = (int)(d->blurBuffer[pxOffset + c] * intensity);
+                    if (bloom <= 0) continue;
+
+                    if (glowBlendMode == 1) {
+                        // Additive
+                        int res = base + bloom;
+                        rb[pxOffset + c] = (unsigned char)(res > 255 ? 255 : res);
+                    } else {
+                        // Screen (Soft CRT Bloom)
+                        int invB = 255 - (bloom > 255 ? 255 : bloom);
+                        int res = 255 - ((255 - base) * invB) / 255;
+                        rb[pxOffset + c] = (unsigned char)(res > 255 ? 255 : (res < 0 ? 0 : res));
+                    }
+                }
             }
         }
     }
@@ -988,18 +1299,201 @@ static OfxStatus actionRender(OfxImageEffectHandle effect, OfxPropertySetHandle 
 }
 
 // ============================================================================
-// ACTION: Instance Changed (handles Info / About button click)
+// ACTION: Instance Changed (handles Presets and GitHub link button)
 // ============================================================================
 static OfxStatus actionInstanceChanged(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs) {
+    InstanceData* d = getInstanceData(effect);
+    if (!d) return kOfxStatOK;
+
     char* paramName = nullptr;
     gPropSuite->propGetString(inArgs, kOfxPropName, 0, &paramName);
-    if (paramName && strcmp(paramName, PARAM_INFO_BUTTON) == 0) {
+    if (!paramName) return kOfxStatOK;
+
+    if (strcmp(paramName, PARAM_INFO_BUTTON) == 0) {
 #if defined(_WIN32)
-        ShellExecuteA(NULL, "open", "https://therealskb.carrd.co/", NULL, NULL, SW_SHOWNORMAL);
+        ShellExecuteA(NULL, "open", "https://github.com/SKBwastaken/ASCIICreatorOFX", NULL, NULL, SW_SHOWNORMAL);
 #else
-        int ret = system("xdg-open https://therealskb.carrd.co/ 2>/dev/null &");
+        int ret = system("xdg-open https://github.com/SKBwastaken/ASCIICreatorOFX 2>/dev/null &");
         (void)ret;
 #endif
+    } else if (strcmp(paramName, PARAM_PRESET) == 0) {
+        int presetIdx = 0;
+        if (d->presetParam && gParamSuite->paramGetValue(d->presetParam, &presetIdx) == kOfxStatOK) {
+            if (presetIdx == 1) {
+                // Classic Matrix CRT (Default)
+                gParamSuite->paramSetValue(d->charSpacingParam, 25);
+                gParamSuite->paramSetValue(d->charAspectParam, 1.0);
+                gParamSuite->paramSetValue(d->fontSourceParam, 3);
+                gParamSuite->paramSetValue(d->fontFileParam, "C:\\Users\\SKB\\Downloads\\Consolas-Regular.ttf");
+                gParamSuite->paramSetValue(d->charSetParam, 2);
+                gParamSuite->paramSetValue(d->colorModeParam, 0);
+                gParamSuite->paramSetValue(d->bgRParam, 0.01);
+                gParamSuite->paramSetValue(d->bgGParam, 0.03);
+                gParamSuite->paramSetValue(d->bgBParam, 0.01);
+                gParamSuite->paramSetValue(d->contrastParam, 30.0);
+                gParamSuite->paramSetValue(d->brightnessParam, 10.0);
+                gParamSuite->paramSetValue(d->invertParam, 0);
+                gParamSuite->paramSetValue(d->randomCharsParam, 0);
+                gParamSuite->paramSetValue(d->fontScaleParam, 1.0);
+                gParamSuite->paramSetValue(d->skipBlackParam, 1);
+                gParamSuite->paramSetValue(d->blackCutoffParam, 15.0);
+                gParamSuite->paramSetValue(d->alphaCutoffParam, 10.0);
+                if (d->enableGlowParam) gParamSuite->paramSetValue(d->enableGlowParam, 1);
+                if (d->glowRadiusParam) gParamSuite->paramSetValue(d->glowRadiusParam, 8);
+                if (d->glowIntensityParam) gParamSuite->paramSetValue(d->glowIntensityParam, 0.85);
+                if (d->glowBlendModeParam) gParamSuite->paramSetValue(d->glowBlendModeParam, 0);
+                gParamSuite->paramSetValue(d->frameHoldParam, 1);
+            } else if (presetIdx == 2) {
+                // Goliath Cyber Lime
+                gParamSuite->paramSetValue(d->charSpacingParam, 25);
+                gParamSuite->paramSetValue(d->charAspectParam, 1.0);
+                gParamSuite->paramSetValue(d->fontSourceParam, 0);
+                gParamSuite->paramSetValue(d->charSetParam, 0);
+                gParamSuite->paramSetValue(d->colorModeParam, 1);
+                gParamSuite->paramSetValue(d->bgRParam, 0.0);
+                gParamSuite->paramSetValue(d->bgGParam, 0.0);
+                gParamSuite->paramSetValue(d->bgBParam, 0.0);
+                gParamSuite->paramSetValue(d->contrastParam, 20.0);
+                gParamSuite->paramSetValue(d->brightnessParam, 5.0);
+                gParamSuite->paramSetValue(d->invertParam, 0);
+                gParamSuite->paramSetValue(d->randomCharsParam, 0);
+                gParamSuite->paramSetValue(d->fontScaleParam, 1.0);
+                gParamSuite->paramSetValue(d->skipBlackParam, 1);
+                gParamSuite->paramSetValue(d->blackCutoffParam, 15.0);
+                gParamSuite->paramSetValue(d->alphaCutoffParam, 10.0);
+                if (d->enableGlowParam) gParamSuite->paramSetValue(d->enableGlowParam, 1);
+                if (d->glowRadiusParam) gParamSuite->paramSetValue(d->glowRadiusParam, 6);
+                if (d->glowIntensityParam) gParamSuite->paramSetValue(d->glowIntensityParam, 0.60);
+                if (d->glowBlendModeParam) gParamSuite->paramSetValue(d->glowBlendModeParam, 0);
+                gParamSuite->paramSetValue(d->frameHoldParam, 1);
+            } else if (presetIdx == 3) {
+                // Full Color Hi-Fi
+                gParamSuite->paramSetValue(d->charSpacingParam, 8);
+                gParamSuite->paramSetValue(d->charAspectParam, 1.0);
+                gParamSuite->paramSetValue(d->fontSourceParam, 1);
+                gParamSuite->paramSetValue(d->charSetParam, 2);
+                gParamSuite->paramSetValue(d->colorModeParam, 0);
+                gParamSuite->paramSetValue(d->bgRParam, 0.0);
+                gParamSuite->paramSetValue(d->bgGParam, 0.0);
+                gParamSuite->paramSetValue(d->bgBParam, 0.0);
+                gParamSuite->paramSetValue(d->contrastParam, 10.0);
+                gParamSuite->paramSetValue(d->brightnessParam, 0.0);
+                gParamSuite->paramSetValue(d->invertParam, 0);
+                gParamSuite->paramSetValue(d->randomCharsParam, 0);
+                gParamSuite->paramSetValue(d->fontScaleParam, 1.0);
+                gParamSuite->paramSetValue(d->skipBlackParam, 0);
+                gParamSuite->paramSetValue(d->blackCutoffParam, 5.0);
+                gParamSuite->paramSetValue(d->alphaCutoffParam, 10.0);
+                if (d->enableGlowParam) gParamSuite->paramSetValue(d->enableGlowParam, 0);
+                gParamSuite->paramSetValue(d->frameHoldParam, 1);
+            } else if (presetIdx == 4) {
+                // Pure 1-Bit Terminal
+                gParamSuite->paramSetValue(d->charSpacingParam, 16);
+                gParamSuite->paramSetValue(d->charAspectParam, 1.0);
+                gParamSuite->paramSetValue(d->fontSourceParam, 0);
+                gParamSuite->paramSetValue(d->charSetParam, 6);
+                gParamSuite->paramSetValue(d->colorModeParam, 10);
+                gParamSuite->paramSetValue(d->bgRParam, 0.0);
+                gParamSuite->paramSetValue(d->bgGParam, 0.0);
+                gParamSuite->paramSetValue(d->bgBParam, 0.0);
+                gParamSuite->paramSetValue(d->contrastParam, 40.0);
+                gParamSuite->paramSetValue(d->brightnessParam, 0.0);
+                gParamSuite->paramSetValue(d->invertParam, 0);
+                gParamSuite->paramSetValue(d->randomCharsParam, 0);
+                gParamSuite->paramSetValue(d->fontScaleParam, 1.0);
+                gParamSuite->paramSetValue(d->skipBlackParam, 1);
+                gParamSuite->paramSetValue(d->blackCutoffParam, 30.0);
+                gParamSuite->paramSetValue(d->alphaCutoffParam, 10.0);
+                if (d->enableGlowParam) gParamSuite->paramSetValue(d->enableGlowParam, 0);
+                gParamSuite->paramSetValue(d->frameHoldParam, 1);
+            } else if (presetIdx == 5) {
+                // Cyberpunk Neon
+                gParamSuite->paramSetValue(d->charSpacingParam, 25);
+                gParamSuite->paramSetValue(d->charAspectParam, 1.0);
+                gParamSuite->paramSetValue(d->fontSourceParam, 0);
+                gParamSuite->paramSetValue(d->charSetParam, 0);
+                gParamSuite->paramSetValue(d->colorModeParam, 4);
+                gParamSuite->paramSetValue(d->bgRParam, 0.04);
+                gParamSuite->paramSetValue(d->bgGParam, 0.0);
+                gParamSuite->paramSetValue(d->bgBParam, 0.08);
+                gParamSuite->paramSetValue(d->contrastParam, 25.0);
+                gParamSuite->paramSetValue(d->brightnessParam, 15.0);
+                gParamSuite->paramSetValue(d->invertParam, 0);
+                gParamSuite->paramSetValue(d->randomCharsParam, 0);
+                gParamSuite->paramSetValue(d->fontScaleParam, 1.0);
+                gParamSuite->paramSetValue(d->skipBlackParam, 1);
+                gParamSuite->paramSetValue(d->blackCutoffParam, 15.0);
+                gParamSuite->paramSetValue(d->alphaCutoffParam, 10.0);
+                if (d->enableGlowParam) gParamSuite->paramSetValue(d->enableGlowParam, 1);
+                if (d->glowRadiusParam) gParamSuite->paramSetValue(d->glowRadiusParam, 7);
+                if (d->glowIntensityParam) gParamSuite->paramSetValue(d->glowIntensityParam, 0.75);
+                if (d->glowBlendModeParam) gParamSuite->paramSetValue(d->glowBlendModeParam, 1);
+                gParamSuite->paramSetValue(d->frameHoldParam, 1);
+            } else if (presetIdx == 6) {
+                // CGA Retro PC
+                gParamSuite->paramSetValue(d->charSpacingParam, 16);
+                gParamSuite->paramSetValue(d->charAspectParam, 1.0);
+                gParamSuite->paramSetValue(d->fontSourceParam, 1);
+                gParamSuite->paramSetValue(d->charSetParam, 1);
+                gParamSuite->paramSetValue(d->colorModeParam, 5);
+                gParamSuite->paramSetValue(d->bgRParam, 0.0);
+                gParamSuite->paramSetValue(d->bgGParam, 0.0);
+                gParamSuite->paramSetValue(d->bgBParam, 0.0);
+                gParamSuite->paramSetValue(d->contrastParam, 20.0);
+                gParamSuite->paramSetValue(d->brightnessParam, 0.0);
+                gParamSuite->paramSetValue(d->invertParam, 0);
+                gParamSuite->paramSetValue(d->randomCharsParam, 0);
+                gParamSuite->paramSetValue(d->fontScaleParam, 1.0);
+                gParamSuite->paramSetValue(d->skipBlackParam, 1);
+                gParamSuite->paramSetValue(d->blackCutoffParam, 15.0);
+                gParamSuite->paramSetValue(d->alphaCutoffParam, 10.0);
+                if (d->enableGlowParam) gParamSuite->paramSetValue(d->enableGlowParam, 0);
+                gParamSuite->paramSetValue(d->frameHoldParam, 1);
+            } else if (presetIdx == 7) {
+                // ZX Spectrum Vintage
+                gParamSuite->paramSetValue(d->charSpacingParam, 14);
+                gParamSuite->paramSetValue(d->charAspectParam, 1.0);
+                gParamSuite->paramSetValue(d->fontSourceParam, 1);
+                gParamSuite->paramSetValue(d->charSetParam, 1);
+                gParamSuite->paramSetValue(d->colorModeParam, 6);
+                gParamSuite->paramSetValue(d->bgRParam, 0.0);
+                gParamSuite->paramSetValue(d->bgGParam, 0.0);
+                gParamSuite->paramSetValue(d->bgBParam, 0.0);
+                gParamSuite->paramSetValue(d->contrastParam, 15.0);
+                gParamSuite->paramSetValue(d->brightnessParam, 0.0);
+                gParamSuite->paramSetValue(d->invertParam, 0);
+                gParamSuite->paramSetValue(d->randomCharsParam, 0);
+                gParamSuite->paramSetValue(d->fontScaleParam, 1.0);
+                gParamSuite->paramSetValue(d->skipBlackParam, 1);
+                gParamSuite->paramSetValue(d->blackCutoffParam, 15.0);
+                gParamSuite->paramSetValue(d->alphaCutoffParam, 10.0);
+                if (d->enableGlowParam) gParamSuite->paramSetValue(d->enableGlowParam, 0);
+                gParamSuite->paramSetValue(d->frameHoldParam, 1);
+            } else if (presetIdx == 8) {
+                // Lo-Fi 12fps Anime Hold
+                gParamSuite->paramSetValue(d->charSpacingParam, 25);
+                gParamSuite->paramSetValue(d->charAspectParam, 1.0);
+                gParamSuite->paramSetValue(d->fontSourceParam, 0);
+                gParamSuite->paramSetValue(d->charSetParam, 0);
+                gParamSuite->paramSetValue(d->colorModeParam, 1);
+                gParamSuite->paramSetValue(d->bgRParam, 0.0);
+                gParamSuite->paramSetValue(d->bgGParam, 0.0);
+                gParamSuite->paramSetValue(d->bgBParam, 0.0);
+                gParamSuite->paramSetValue(d->contrastParam, 20.0);
+                gParamSuite->paramSetValue(d->brightnessParam, 5.0);
+                gParamSuite->paramSetValue(d->invertParam, 0);
+                gParamSuite->paramSetValue(d->randomCharsParam, 0);
+                gParamSuite->paramSetValue(d->fontScaleParam, 1.0);
+                gParamSuite->paramSetValue(d->skipBlackParam, 1);
+                gParamSuite->paramSetValue(d->blackCutoffParam, 15.0);
+                gParamSuite->paramSetValue(d->alphaCutoffParam, 10.0);
+                if (d->enableGlowParam) gParamSuite->paramSetValue(d->enableGlowParam, 1);
+                if (d->glowRadiusParam) gParamSuite->paramSetValue(d->glowRadiusParam, 6);
+                if (d->glowIntensityParam) gParamSuite->paramSetValue(d->glowIntensityParam, 0.60);
+                if (d->glowBlendModeParam) gParamSuite->paramSetValue(d->glowBlendModeParam, 0);
+                gParamSuite->paramSetValue(d->frameHoldParam, 2);
+            }
+        }
     }
     return kOfxStatOK;
 }
